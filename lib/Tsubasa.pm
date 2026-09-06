@@ -19,7 +19,7 @@ use FindBin;
 use MCE::Loop;
 use Sys::CpuAffinity;
 use Storable   qw(lock_store);
-use Mojo::JSON qw(to_json);
+use Mojo::JSON qw(to_json decode_json encode_json);
 use Config;
 
 #As this is a new process, reloading the LRR libs into INC is needed.
@@ -47,6 +47,8 @@ use LANraragi::Utils::Plugins;    # Needed here since Tsubasa doesn't inherit fr
 use LANraragi::Model::Search;     # idem
 
 use constant IS_UNIX => ( $Config{osname} ne 'MSWin32' );
+
+my %TANK_METADATA = ( "name", 0, "summary", -1, "tags", -2, "progress", -3 );
 
 # Logger and Database objects
 my $logger = get_logger( "Tsubasa", "tsubasa" );
@@ -167,6 +169,43 @@ sub print_files(@files) {
         $file =~ s/$remove//; 
         $logger->info("$file");
     }
+}
+
+sub read_json($path) {
+    open(my $fh, '<:encoding(UTF-8)', $path)
+        or return;
+
+    local $/;  # Slurp mode
+    my $json_text = <$fh>;
+
+    close($fh);
+
+    return decode_json($json_text);
+}
+
+sub check_lrr_json($path) {
+    my $filename = $path . '/' . "LRR.json";
+    if (-f $filename) {
+        my $data = read_json($filename);
+        return $data;
+    } else {
+        return;
+    }
+}
+
+sub save_json_file ($path, $json_ref) {
+    die "Second argument must be a hash reference"
+        unless ref($json_ref) eq 'HASH';
+
+    open(my $fh, '>:raw', $path)
+        or die "Cannot open '$path' for writing: $!";
+
+    # encode_json returns a UTF-8 encoded byte string
+    print $fh encode_json($json_ref)
+        or die "Cannot write to '$path': $!";
+
+    close($fh)
+        or die "Cannot close '$path': $!";
 }
 
 sub is_second_level( $file, $remove ) {
@@ -393,29 +432,60 @@ sub deleted_file_callback ($name) {
 sub add_new_files (@files) {
     my $redis = LANraragi::Model::Config->get_redis_config;
     my $current_manga = "";
+    my $dirname = LANraragi::Model::Config->get_userdir . "/local";
 
     foreach my $file (@files) {
         $logger->debug("Processing $file");
 
-        my ( $found, $name, $chapter ) = get_manga_identifiers( $file );
+        my ( $found, $manga_name, $chapter ) = get_manga_identifiers( $file );
         my $manga_id;
 
-        if ($name ne $current_manga) {
+        if ($manga_name ne $current_manga) {
+            $current_manga = $manga_name;
             # TODO: Check if folder has an LRR.json with the ID, otherwise create a new ID.
+            my $lrr_json = check_lrr_json( $dirname.'/'.$manga_name );
+            my $new = 0;
 
-            $manga_id = get_random_UUID("MANGA");
+            if ($lrr_json) {
+                if ( $lrr_json->{id} ) {
+                    $manga_id = $lrr_json->{id};
+                } else {
+                    $new = 1;
+                }
+            } else {
+                $new = 1;
+            }
+
+            if ($new) {
+                $manga_id = get_random_UUID("MANGA");
+                my %json = (
+                    id => $manga_id,
+                );
+                eval { save_json_file( $dirname.'/'.$manga_name.'/LRR.json', \%json ); };
+
+                if ($@) {
+                    $logger->error("Error scanning $file: $@");
+                }
+            }
+
+            unless ( $redis->exists($manga_id) ) {
+                $redis->zadd( $manga_id, $TANK_METADATA{"name"},     redis_encode("name_${manga_name}") );
+                $redis->zadd( $manga_id, $TANK_METADATA{"summary"},  "summary_" );
+                $redis->zadd( $manga_id, $TANK_METADATA{"tags"},     "tags_" );
+                $redis->zadd( $manga_id, $TANK_METADATA{"progress"}, "progress_0" );
+            }
 
             # Validate if the ID exists in the DB, otherwise create a new "Tank"
-
-            # Add the id to the folder as an LRR.json
         }
+
+        $logger->info("Manga $manga_id");
 
         # Individual files are also eval'd so we can keep scanning
-        eval { add_to_filemap( $redis, $file, $manga_id ); };
+        # eval { add_to_filemap( $redis, $file, $manga_id ); };
 
-        if ($@) {
-            $logger->error("Error scanning $file: $@");
-        }
+        # if ($@) {
+        #     $logger->error("Error scanning $file: $@");
+        # }
     }
 
     $redis->quit();
